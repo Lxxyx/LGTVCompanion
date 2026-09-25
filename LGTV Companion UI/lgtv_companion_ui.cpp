@@ -2051,6 +2051,7 @@ LRESULT CALLBACK WndOptionsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 
 		SendDlgItemMessage(hWnd, IDC_STATIC_C, WM_SETFONT, (WPARAM)h_edit_small_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDC_COMBO_MODE, WM_SETFONT, (WPARAM)h_edit_medium_font, MAKELPARAM(TRUE, 0));
+		SendDlgItemMessage(hWnd, IDC_COMBO_REMOTE_END, WM_SETFONT, (WPARAM)h_edit_medium_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDC_COMBO_LOG, WM_SETFONT, (WPARAM)h_edit_medium_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDC_COMBO_UPDATE, WM_SETFONT, (WPARAM)h_edit_medium_font, MAKELPARAM(TRUE, 0));
 
@@ -2134,6 +2135,11 @@ LRESULT CALLBACK WndOptionsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 					{
 						std::wstring strfind = L"<Data Name='param5'>";
 						size_t f = xml.find(strfind);
+						if (f == std::wstring::npos)
+						{
+							strfind = L"<Data Name=\"param5\">";
+							f = xml.find(strfind);
+						}
 						if (f != std::wstring::npos)
 						{
 							size_t e = xml.find(L"<", f + 1);
@@ -2204,7 +2210,18 @@ LRESULT CALLBACK WndOptionsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 		SendMessage(GetDlgItem(hWnd, IDC_COMBO_MODE), (UINT)CB_ADDSTRING, (WPARAM)0, (LPARAM)ls.c_str());
 		SendMessage(GetDlgItem(hWnd, IDC_COMBO_MODE), (UINT)CB_SETCURSEL, (WPARAM)Prefs.remote_streaming_host_prefer_power_off_ ? 0 : 1, (LPARAM)0);
 
+		SendMessage(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), (UINT)CB_RESETCONTENT, (WPARAM)0, (LPARAM)0);
+		ls = L"Display on";
+		SendMessage(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), (UINT)CB_ADDSTRING, (WPARAM)0, (LPARAM)ls.c_str());
+		ls = L"Display off";
+		SendMessage(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), (UINT)CB_ADDSTRING, (WPARAM)0, (LPARAM)ls.c_str());
+		ls = L"Restore display";
+		SendMessage(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), (UINT)CB_ADDSTRING, (WPARAM)0, (LPARAM)ls.c_str());
+		SendMessage(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), (UINT)CB_SETCURSEL, (WPARAM)Prefs.remote_streaming_host_end_mode_, (LPARAM)0);
+
 		EnableWindow(GetDlgItem(hWnd, IDC_COMBO_MODE), Prefs.remote_streaming_host_support_ ? true :  false);
+		// "Remote streaming end mode" only applies in power-off mode (index 0)
+		EnableWindow(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), (Prefs.remote_streaming_host_support_ && Prefs.remote_streaming_host_prefer_power_off_) ? true : false);
 		EnableWindow(GetDlgItem(hWnd, IDC_CHECK_TOPOLOGY_LOGON), Prefs.topology_support_ ? true : false);
 		EnableWindow(GetDlgItem(hWnd, IDOK), false);
 	}break;
@@ -2292,7 +2309,10 @@ LRESULT CALLBACK WndOptionsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 			case IDC_CHECK_TOPOLOGY_LOGON:
 
 			{
-				EnableWindow(GetDlgItem(hWnd, IDC_COMBO_MODE), IsDlgButtonChecked(hWnd, IDC_CHECK_REMOTE));
+				BOOL remoteOn = IsDlgButtonChecked(hWnd, IDC_CHECK_REMOTE);
+				BOOL powerOffMode = (SendMessage(GetDlgItem(hWnd, IDC_COMBO_MODE), CB_GETCURSEL, 0, 0) == 0);
+				EnableWindow(GetDlgItem(hWnd, IDC_COMBO_MODE), remoteOn);
+				EnableWindow(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), remoteOn && powerOffMode);
 				EnableWindow(GetDlgItem(hWnd, IDOK), true);
 			}break;
 
@@ -2323,6 +2343,10 @@ LRESULT CALLBACK WndOptionsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 						Prefs.remote_streaming_host_prefer_power_off_ = false;
 					else
 						Prefs.remote_streaming_host_prefer_power_off_ = true;
+
+					int selection_end = (int)(SendMessage(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), (UINT)CB_GETCURSEL, (WPARAM)0, (LPARAM)0));
+					if (selection_end >= 0)
+						Prefs.remote_streaming_host_end_mode_ = selection_end;
 
 					int selection_timing = (int)(SendMessage(GetDlgItem(hWnd, IDC_COMBO_TIMING), (UINT)CB_GETCURSEL, (WPARAM)0, (LPARAM)0));
 					if (selection_timing == 2)
@@ -2383,6 +2407,12 @@ LRESULT CALLBACK WndOptionsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 		}break;
 		case CBN_SELCHANGE:
 		{
+			if (LOWORD(wParam) == IDC_COMBO_MODE)
+			{
+				// "Remote streaming end mode" only applies in power-off mode (index 0)
+				BOOL powerOffMode = (SendMessage(GetDlgItem(hWnd, IDC_COMBO_MODE), CB_GETCURSEL, 0, 0) == 0);
+				EnableWindow(GetDlgItem(hWnd, IDC_COMBO_REMOTE_END), IsDlgButtonChecked(hWnd, IDC_CHECK_REMOTE) && powerOffMode);
+			}
 			EnableWindow(GetDlgItem(hWnd, IDOK), true);
 		}break;
 		default:break;
@@ -2968,6 +2998,7 @@ LRESULT CALLBACK WndUserIdleProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 		CheckDlgButton(hWnd, IDC_CHECK_VWL_FG, Prefs.user_idle_mode_disable_while_video_wake_lock_foreground_ ? BST_CHECKED : BST_UNCHECKED);
 		CheckDlgButton(hWnd, IDC_CHECK_VWL_FULLSCREEN, Prefs.user_idle_mode_disable_while_video_wake_lock_fullscreen_ ? BST_CHECKED : BST_UNCHECKED);
 		CheckDlgButton(hWnd, IDC_CHECK_MUTE, Prefs.user_idle_mode_mute_speakers_ ? BST_CHECKED : BST_UNCHECKED);
+		CheckDlgButton(hWnd, IDC_CHECK_IGNORE_SYSWIDE, Prefs.user_idle_mode_ignore_system_wide_fallback_ ? BST_CHECKED : BST_UNCHECKED);
 		CheckDlgButton(hWnd, IDC_CHECK_IGNORED_KEYS, Prefs.user_idle_mode_ignored_keys_ ? BST_CHECKED : BST_UNCHECKED);
 
 		EnableWindow(GetDlgItem(hWnd, IDC_LIST), Prefs.user_idle_mode_process_control_);
@@ -3232,6 +3263,7 @@ LRESULT CALLBACK WndUserIdleProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 				case IDC_CHECK_VWL_FG:
 				case IDC_CHECK_VWL_FULLSCREEN:
 				case IDC_CHECK_MUTE:
+				case IDC_CHECK_IGNORE_SYSWIDE:
 				{
 					EnableWindow(GetDlgItem(hWnd, IDOK), true);
 				}break;
@@ -3254,6 +3286,7 @@ LRESULT CALLBACK WndUserIdleProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 				Prefs.user_idle_mode_disable_while_video_wake_lock_foreground_ = IsDlgButtonChecked(hWnd, IDC_CHECK_VWL_FG);
 				Prefs.user_idle_mode_disable_while_video_wake_lock_fullscreen_ = IsDlgButtonChecked(hWnd, IDC_CHECK_VWL_FULLSCREEN);
 				Prefs.user_idle_mode_mute_speakers_ = IsDlgButtonChecked(hWnd, IDC_CHECK_MUTE);
+				Prefs.user_idle_mode_ignore_system_wide_fallback_ = IsDlgButtonChecked(hWnd, IDC_CHECK_IGNORE_SYSWIDE);
 				Prefs.user_idle_mode_ignored_keys_ = IsDlgButtonChecked(hWnd, IDC_CHECK_IGNORED_KEYS);
 				Prefs.user_idle_mode_process_control_list_ = process_list_temp;
 				Prefs.ignored_keys.clear();
@@ -3317,6 +3350,12 @@ LRESULT CALLBACK WndUserIdleProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 				customMsgBox(hWnd, L"Specify keys that are ignored when determining idle state. This is used to keep User Idle Mode active even though the specified keys "
 					"are pressed.", L"Ignored Keys", MB_OK | MB_ICONINFORMATION);
 			}
+			else if (wParam == IDC_SYSLINK_INFO_SYSWIDE)
+			{
+				customMsgBox(hWnd, L"Specify if the TV's speakers should be muted when User Idle Mode is triggered.\n\n"
+					"Consider disabling the fallback input detection if you are experiencing an issue where User Idle Mode does not trigger properly. "
+					"The fallback method is however required when working with some virtual or remote desktops.", L"User Idle Mode Other", MB_OK | MB_ICONINFORMATION);
+			}
 			else if (wParam == IDC_SYSLINK_ADD)
 			{
 				PostMessage(hWnd, APP_LISTBOX_ADD, 1, 0);
@@ -3347,7 +3386,8 @@ LRESULT CALLBACK WndUserIdleProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 		SetTextColor(hdcStatic, COLORREF(COLOR_STATIC));
 		if ((HWND)lParam == GetDlgItem(hWnd, IDC_CHECK_PROCESS_CONTROL)
 			|| (HWND)lParam == GetDlgItem(hWnd, IDC_CHECK_FULLSCREEN)
-			|| (HWND)lParam == GetDlgItem(hWnd, IDC_CHECK_VWL))
+			|| (HWND)lParam == GetDlgItem(hWnd, IDC_CHECK_VWL)
+			|| (HWND)lParam == GetDlgItem(hWnd, IDC_CHECK_IGNORE_SYSWIDE))
 		{
 			SetBkMode(hdcStatic, TRANSPARENT);
 		}

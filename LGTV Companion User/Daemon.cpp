@@ -35,6 +35,7 @@
 #include <Hidsdi.h>
 #include <hidpi.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <Shobjidl.h>
 #include <ctime>
@@ -63,9 +64,12 @@
 #define         TIMER_VERSIONCHECK_DELAY				30000
 #define         TIMER_CHECK_PROCESSES_DELAY				5000
 #define         TIMER_TOPOLOGY_COLLECTION_DELAY			3000
+#define         TIMER_DISPLAYS_OFF						24
+#define         TIMER_DISPLAYS_OFF_DELAY				2000
 #define			COPYDATA_MUTEX_WAIT						10
 #define         APP_DISPLAYCHANGE						WM_USER+10
 #define         APP_SET_MESSAGEFILTER					WM_USER+11
+#define         APP_DISPLAYS_OFF_REQUEST				WM_USER+12
 #define         APP_USER_IDLE_ON						1
 #define         APP_USER_IDLE_OFF						2
 #define         TOPOLOGY_OK								1
@@ -88,6 +92,12 @@
 #define			SUNSHINE_FILE_CONF						"sunshine.conf"
 #define			SUNSHINE_FILE_LOG						"sunshine.log"
 #define			SUNSHINE_FILE_SVC						L"sunshine.exe"
+#define			HID_VENDOR_ID_VALVE						0x28DE
+// Steam Controller 2 ("Triton") vendor HID input report IDs, per SDL's steam/controller_structs.h
+#define			HID_VALVE_TRITON_STATE					0x42
+#define			HID_VALVE_TRITON_STATE_BLE				0x45
+#define			HID_VALVE_TRITON_STATE_TIMESTAMP		0x47
+#define			HID_USAGE_PAGE_VENDOR_FIRST				0xFF00
 
 
 struct DisplayInfo {					// Display info
@@ -125,6 +135,10 @@ struct ControllerInfo { // Cache for raw input data stuff
 	PHIDP_PREPARSED_DATA ppd = NULL;
 	HIDP_CAPS caps = { 0 };
 	std::vector<int> axis_value;
+	std::vector<BYTE> last_hid_report;
+	DWORD vendor_id = 0;
+	USHORT usage_page = 0;
+	USHORT usage = 0;
 };
 
 // Globals:
@@ -156,6 +170,8 @@ std::shared_ptr<IpcClient2>		p_pipe_client;
 Preferences						Prefs(CONFIG_FILE);
 std::string						session_id;
 std::unordered_map<std::wstring, ControllerInfo> g_device_cache; // Key = device path
+
+static bool RawInput_ValveVendorReportIsActivity(ControllerInfo& cache, const RAWHID& hid);
 
 //Application entry point
 int APIENTRY wWinMain(_In_ HINSTANCE Instance,
@@ -260,32 +276,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE Instance,
 		SetTimer(h_main_wnd, TIMER_CHECK_PROCESSES, TIMER_CHECK_PROCESSES_DELAY, (TIMERPROC)NULL);
 	if (Prefs.user_idle_mode_)
 	{
-		RAWINPUTDEVICE Rid[4];
-		Rid[0].usUsagePage = 0x01;							// HID_USAGE_PAGE_GENERIC
-		Rid[0].usUsage = 0x02;								// HID_USAGE_GENERIC_MOUSE
-		Rid[0].dwFlags = daemon_is_visible ? RIDEV_INPUTSINK : RIDEV_INPUTSINK | RIDEV_NOLEGACY;
-		Rid[0].hwndTarget = h_main_wnd;
-
-		Rid[1].usUsagePage = 0x01;							// HID_USAGE_PAGE_GENERIC
-		Rid[1].usUsage = 0x04;								// HID_USAGE_GENERIC_JOYSTICK
-		Rid[1].dwFlags = RIDEV_INPUTSINK;
-		Rid[1].hwndTarget = h_main_wnd;
-
-		Rid[2].usUsagePage = 0x01;							// HID_USAGE_PAGE_GENERIC
-		Rid[2].usUsage = 0x05;								// HID_USAGE_GENERIC_GAMEPAD
-		Rid[2].dwFlags = RIDEV_INPUTSINK;
-		Rid[2].hwndTarget = h_main_wnd;
-
-		Rid[3].usUsagePage = 0x01;							// HID_USAGE_PAGE_GENERIC
-		Rid[3].usUsage = 0x06;								// HID_USAGE_GENERIC_KEYBOARD
-		Rid[3].dwFlags = daemon_is_visible ? RIDEV_INPUTSINK : RIDEV_INPUTSINK | RIDEV_NOLEGACY;
-		Rid[3].hwndTarget = h_main_wnd;
-
-		UINT deviceCount = sizeof(Rid) / sizeof(*Rid);
-		if (RegisterRawInputDevices(Rid, deviceCount, sizeof(Rid[0])) == FALSE)
-		{
-			log(L"Failed to register for Raw Input!");
-		}
+		RawInput_RegisterDevices(h_main_wnd);
 		time_of_last_raw_input = GetTickCount();
 		SetTimer(h_main_wnd, TIMER_MAIN, TIMER_MAIN_DELAY_WHEN_BUSY, (TIMERPROC)NULL);
 		SetTimer(h_main_wnd, TIMER_IDLE, Prefs.user_idle_mode_delay_ * 60 * 1000, (TIMERPROC)NULL);
@@ -420,6 +411,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			ShowWindow(h_main_wnd, daemon_is_visible ? SW_SHOWNORMAL : SW_HIDE);
 	}break;
 
+	case APP_DISPLAYS_OFF_REQUEST:
+	{
+		// The service requests that the windows displays are turned off, to remain in
+		// sync with managed devices which stay powered off when a remote streaming
+		// session ends. Only act when running in the physical console session.
+		DWORD session_id = 0;
+		if (ProcessIdToSessionId(GetCurrentProcessId(), &session_id) && session_id == WTSGetActiveConsoleSessionId())
+		{
+			log(L"Service requests windows displays OFF (remote streaming end mode).");
+			SetTimer(hWnd, TIMER_DISPLAYS_OFF, TIMER_DISPLAYS_OFF_DELAY, (TIMERPROC)NULL);
+		}
+	}break;
+
 	case WM_INPUT:
 	{
 		if (!lParam)
@@ -446,7 +450,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			if (Prefs.user_idle_mode_ignored_keys_)
 			{
 				DWORD key_code = tools::keyCodeFromRawKeyboard(raw->data.keyboard);
-				log(std::to_wstring(key_code));
 				if (std::find(Prefs.ignored_keys.begin(), Prefs.ignored_keys.end(), key_code) != Prefs.ignored_keys.end())
 				{
 					last_input_was_ignored = true;
@@ -488,14 +491,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			std::wstring devicePath(deviceName.data());
 			auto it = g_device_cache.find(devicePath);
 			if (it == g_device_cache.end()) {
-				if (!RawInput_AddToCache(devicePath))
+				if (!RawInput_AddToCache(devicePath, raw->header.hDevice))
 					return 0;
 				it = g_device_cache.find(devicePath); // Re-check after insertion attempt
 				if (it == g_device_cache.end())
 					return 0;
 			}
-			// Check whether a digital button was pressed on the controller
 			ControllerInfo& cache = it->second;
+			// Valve vendor-defined collections (Steam Controller 2) expose opaque data which
+			// cannot be interpreted via the generic button/axis path below. They stream
+			// continuously (sequence number, gyro/accelerometer), so only the user-actuated
+			// fields of the known state reports may count as activity.
+			if (cache.vendor_id == HID_VENDOR_ID_VALVE && cache.usage_page >= HID_USAGE_PAGE_VENDOR_FIRST)
+			{
+				if (RawInput_ValveVendorReportIsActivity(cache, raw->data.hid))
+				{
+					last_input_was_ignored = false;
+					time_of_last_raw_input = tick_now;
+				}
+				return 0;
+			}
+			// Check whether a digital button was pressed on the controller
 			if (cache.caps.NumberInputButtonCaps > 0)
 			{
 				std::vector<HIDP_BUTTON_CAPS> buttonCaps(cache.caps.NumberInputButtonCaps);
@@ -622,8 +638,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				fallback_count = 0;
 				last_input = time_of_last_raw_input;
 			}
-			// but also use GetLastInputInfo() to determine user input (fallback method)
-			else if(!last_input_was_ignored && (lii.dwTime > time_of_last_raw_input) && (lii.dwTime - time_of_last_raw_input > 1000 ))
+			// but also use GetLastInputInfo() as a fallback, unless the user has disabled it (some background software can cause false positives here)
+			else if(!Prefs.user_idle_mode_ignore_system_wide_fallback_ && !last_input_was_ignored && (lii.dwTime > time_of_last_raw_input) && (lii.dwTime - time_of_last_raw_input > 1000 ))
 			{
 				// discover and discard controllers that are jittery (i.e. that send constant updates)
 				if ((user_is_idle && abs((int)(lii.dwTime - time_of_last_input_info - (DWORD)TIMER_MAIN_DELAY_WHEN_IDLE)) <= 20)
@@ -728,6 +744,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 			KillTimer(hWnd, (UINT_PTR)REMOTE_DISCONNECT);
 			communicateWithService(L"remote_disconnect", false);
+		}break;
+		case TIMER_DISPLAYS_OFF:
+		{
+			// short delay has passed to let the streaming host restore resolution/HDR etc
+			KillTimer(hWnd, (UINT_PTR)TIMER_DISPLAYS_OFF);
+			log(L"Turning off windows displays (sync with remote streaming end mode).");
+			SendMessage(hWnd, WM_SYSCOMMAND, SC_MONITORPOWER, (LPARAM)2);
 		}break;
 		case TIMER_TOPOLOGY_COLLECTION:
 		{
@@ -890,6 +913,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		//clear the raw input cache whenever a controller was connected/disconnected.
 		RawInput_ClearCache();
+		if (Prefs.user_idle_mode_)
+			RawInput_RegisterDevices(hWnd);
 
 		if (Prefs.remote_streaming_host_support_ && lParam && wParam)
 		{
@@ -1640,6 +1665,8 @@ std::string sunshine_GetConfVal(std::string buf, std::string conf_item)
 }
 void ipcCallback(std::wstring message, LPVOID pt)
 {
+	if (message.find(L"DAEMON_DISPLAYS_OFF") != std::wstring::npos)
+		PostMessage(h_main_wnd, APP_DISPLAYS_OFF_REQUEST, NULL, NULL);
 	return;
 }
 
@@ -1682,24 +1709,168 @@ bool IsWindowElevated(HWND hWnd) {
 	return isElevated;
 }
 
-bool RawInput_AddToCache(const std::wstring& devicePath) {
-	HANDLE hDevice = CreateFile(devicePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-	if (hDevice == INVALID_HANDLE_VALUE) 
+static void RawInput_AddRegistration(std::vector<RAWINPUTDEVICE>& devices, std::unordered_set<DWORD>& registered, USHORT usagePage, USHORT usage, DWORD flags, HWND hwnd)
+{
+	DWORD key = ((DWORD)usagePage << 16) | usage;
+	if (registered.find(key) != registered.end())
+		return;
+
+	RAWINPUTDEVICE device = { 0 };
+	device.usUsagePage = usagePage;
+	device.usUsage = usage;
+	device.dwFlags = flags;
+	device.hwndTarget = hwnd;
+	devices.push_back(device);
+	registered.insert(key);
+}
+
+bool RawInput_RegisterDevices(HWND hwnd)
+{
+	std::vector<RAWINPUTDEVICE> devices;
+	std::unordered_set<DWORD> registered;
+
+	RawInput_AddRegistration(devices, registered, HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_MOUSE,
+		daemon_is_visible ? RIDEV_INPUTSINK : RIDEV_INPUTSINK | RIDEV_NOLEGACY, hwnd);
+	RawInput_AddRegistration(devices, registered, HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_JOYSTICK,
+		RIDEV_INPUTSINK, hwnd);
+	RawInput_AddRegistration(devices, registered, HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_GAMEPAD,
+		RIDEV_INPUTSINK, hwnd);
+	RawInput_AddRegistration(devices, registered, HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_KEYBOARD,
+		daemon_is_visible ? RIDEV_INPUTSINK : RIDEV_INPUTSINK | RIDEV_NOLEGACY, hwnd);
+	RawInput_AddRegistration(devices, registered, HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_MULTI_AXIS_CONTROLLER,
+		RIDEV_INPUTSINK, hwnd);
+
+	UINT deviceCount = 0;
+	if (GetRawInputDeviceList(nullptr, &deviceCount, sizeof(RAWINPUTDEVICELIST)) == 0 && deviceCount > 0)
+	{
+		std::vector<RAWINPUTDEVICELIST> rawDevices(deviceCount);
+		if (GetRawInputDeviceList(rawDevices.data(), &deviceCount, sizeof(RAWINPUTDEVICELIST)) != (UINT)-1)
+		{
+			for (UINT i = 0; i < deviceCount; ++i)
+			{
+				if (rawDevices[i].dwType != RIM_TYPEHID)
+					continue;
+
+				RID_DEVICE_INFO deviceInfo = { 0 };
+				UINT deviceInfoSize = sizeof(deviceInfo);
+				deviceInfo.cbSize = sizeof(deviceInfo);
+				if (GetRawInputDeviceInfo(rawDevices[i].hDevice, RIDI_DEVICEINFO, &deviceInfo, &deviceInfoSize) == (UINT)-1)
+					continue;
+				if (deviceInfo.dwType != RIM_TYPEHID || deviceInfo.hid.dwVendorId != HID_VENDOR_ID_VALVE)
+					continue;
+
+				// Steam Controller 2 exposes active controls through vendor-defined HID collections.
+				RawInput_AddRegistration(devices, registered, deviceInfo.hid.usUsagePage, deviceInfo.hid.usUsage, RIDEV_INPUTSINK, hwnd);
+			}
+		}
+	}
+
+	if (RegisterRawInputDevices(devices.data(), (UINT)devices.size(), sizeof(devices[0])) == FALSE)
+	{
+		log(L"Failed to register for Raw Input!");
 		return false;
+	}
+	return true;
+}
+
+static int RawInput_ReadInt16(const BYTE* data)
+{
+	short value;
+	memcpy(&value, data, sizeof(value));
+	return value;
+}
+
+// Compare the user-actuated fields of two Steam Controller 2 ("Triton") state reports.
+// Buffers start at the report ID byte; packed payload layout per SDL's
+// steam/controller_structs.h: seq_num (1 byte), buttons (4 bytes), then triggers,
+// sticks and trackpads as consecutive 16-bit values. The sequence number, trackpad
+// timestamp and IMU fields change on every packet regardless of user interaction
+// and must not count as activity.
+static bool RawInput_TritonStateChanged(const BYTE* previous, const BYTE* current, bool padsShifted)
+{
+	if (memcmp(previous + 2, current + 2, 4) != 0) // buttons bitmask, includes capacitive touch
+		return true;
+	const int sensitivity = (int)(0.045 * 65535); // same sensitivity as the generic axis detection
+	static const DWORD axisOffsets[] = { 6, 8, 10, 12, 14, 16 }; // triggers L/R, sticks LX/LY/RX/RY
+	for (DWORD offset : axisOffsets)
+	{
+		if (abs(RawInput_ReadInt16(previous + offset) - RawInput_ReadInt16(current + offset)) >= sensitivity)
+			return true;
+	}
+	// Trackpads: X, Y, pressure for left then right. The 0x47 report inserts a 16-bit
+	// trackpad timestamp before this block.
+	const DWORD padBase = padsShifted ? 20 : 18;
+	for (DWORD offset = padBase; offset < padBase + 12; offset += 2)
+	{
+		if (abs(RawInput_ReadInt16(previous + offset) - RawInput_ReadInt16(current + offset)) >= sensitivity)
+			return true;
+	}
+	return false;
+}
+
+static bool RawInput_ValveVendorReportIsActivity(ControllerInfo& cache, const RAWHID& hid)
+{
+	bool activity = false;
+	if (hid.dwSizeHid == 0 || hid.dwCount == 0)
+		return false;
+	for (DWORD n = 0; n < hid.dwCount; ++n)
+	{
+		const BYTE* report = hid.bRawData + n * hid.dwSizeHid;
+		const BYTE reportId = report[0];
+		if (reportId != HID_VALVE_TRITON_STATE && reportId != HID_VALVE_TRITON_STATE_BLE
+			&& reportId != HID_VALVE_TRITON_STATE_TIMESTAMP)
+			continue; // battery level, wireless status etc - not user input
+		const bool padsShifted = (reportId == HID_VALVE_TRITON_STATE_TIMESTAMP);
+		const DWORD relevantSize = 1 + (padsShifted ? 31 : 29); // report id + payload up to and including the trackpads
+		if (hid.dwSizeHid < relevantSize)
+			continue;
+		std::vector<BYTE> snapshot(report, report + relevantSize);
+		if (cache.last_hid_report.size() == relevantSize && cache.last_hid_report[0] == reportId
+			&& RawInput_TritonStateChanged(cache.last_hid_report.data(), snapshot.data(), padsShifted))
+			activity = true;
+		cache.last_hid_report = std::move(snapshot);
+	}
+	return activity;
+}
+
+bool RawInput_AddToCache(const std::wstring& devicePath, HANDLE rawInputDevice) {
+	ControllerInfo info;
+	RID_DEVICE_INFO deviceInfo = { 0 };
+	UINT deviceInfoSize = sizeof(deviceInfo);
+	deviceInfo.cbSize = sizeof(deviceInfo);
+	if (GetRawInputDeviceInfo(rawInputDevice, RIDI_DEVICEINFO, &deviceInfo, &deviceInfoSize) != (UINT)-1
+		&& deviceInfo.dwType == RIM_TYPEHID)
+	{
+		info.vendor_id = deviceInfo.hid.dwVendorId;
+		info.usage_page = deviceInfo.hid.usUsagePage;
+		info.usage = deviceInfo.hid.usUsage;
+	}
+
+	HANDLE hDevice = CreateFile(devicePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (hDevice == INVALID_HANDLE_VALUE)
+	{
+		g_device_cache[devicePath] = info;
+		return true;
+	}
 
 	PHIDP_PREPARSED_DATA ppd = nullptr;
 	if (!HidD_GetPreparsedData(hDevice, &ppd)) {
 		CloseHandle(hDevice);
-		return false;
+		g_device_cache[devicePath] = info;
+		return true;
 	}
 
 	HIDP_CAPS caps;
 	if (HidP_GetCaps(ppd, &caps) != HIDP_STATUS_SUCCESS) {
 		HidD_FreePreparsedData(ppd);
 		CloseHandle(hDevice);
-		return false;
+		g_device_cache[devicePath] = info;
+		return true;
 	}
-	g_device_cache[devicePath] = { hDevice, ppd, caps };
+	info.hDevice = hDevice;
+	info.ppd = ppd;
+	info.caps = caps;
+	g_device_cache[devicePath] = info;
 	return true;
 }
 

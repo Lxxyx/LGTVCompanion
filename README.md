@@ -2,7 +2,7 @@
 
 An experimental community fork of [JPersson77/LGTVCompanion](https://github.com/JPersson77/LGTVCompanion), sharing desktop changes for LG WebOS TVs used as PC displays.
 
-The custom source is on **`hdmi-gsync-controls`**, based on upstream commit `f9561e2d67b5cda61a9041e96ea72cf5adeda812`. It has not been rebased onto the latest upstream release. This is a source snapshot, not a newly tested binary release or an official LG/NVIDIA firmware fix.
+The custom source is on **`hdmi-gsync-controls`**, synchronized with upstream `master` commit `a37d054296d4957d607d8509272ad211d4a44e50` on September 25, 2026. The HDMI / G-SYNC additions are preserved. This is a source distribution, not an official LG/NVIDIA firmware fix.
 
 ## Included features
 
@@ -48,11 +48,11 @@ Use the matching custom service build; launching a custom GUI alongside an unmod
 - The console `-toggle_gsync` path queries the TV; it is separate from the cached GUI/service toggle paths.
 - The service's 800 ms off/on sequence requests setting changes without verifying that the TV has completed the handshake.
 - The IP finder assumes candidate `/24` ranges, uses the first configured valid MAC address, and is limited to ARP-reachable devices. A discovery attempt can take time.
-- No fresh compilation or hardware regression test was performed when publishing this source snapshot. Existing behavior is preserved rather than presented as a finished fix.
+- The UI, service, user daemon, console, and updater all passed x64 Release compilation after synchronization. Hardware regression testing has not been performed, so runtime recovery behavior remains unverified on this merged version.
 
 ## Building
 
-Use the upstream Windows C++ setup: Visual Studio with the v143 C++ toolset, a Windows 10 SDK, and vcpkg dependencies from `vcpkg.json`. The upstream [build workflow](.github/workflows/continuous-integration.yml) documents manifest-enabled MSBuild commands and installer dependencies.
+Use the upstream Windows C++ setup: Visual Studio 2026 with the v145 C++ toolset, a Windows SDK, and vcpkg dependencies from `vcpkg.json`. The upstream [build workflow](.github/workflows/continuous-integration.yml) documents manifest-enabled MSBuild commands and installer dependencies. The five application projects were compiled locally; the installer was not built or tested.
 
 For local development, use matching UI, console, and service builds. Upstream installation instructions and release links refer to the original project and do not include these custom features. No prebuilt EXEs, PDBs, pairing credentials, device configurations, logs, or local backups are distributed by this branch.
 
@@ -62,7 +62,7 @@ For local development, use matching UI, console, and service builds. Upstream in
 
 它提供显示状态恢复的手段，不是 LG / NVIDIA 官方的花屏修复。当前开机选项虽然写着“Re-sync”，实际仍是根据缓存切换一次开关；需要明确关闭再开启时，应使用上面的 `-resync_gsync` 服务命令。自定义界面需要配套的自定义后台服务才能使用新增服务功能。
 
-本次公开的是源码快照，保留原有行为，没有重新编译或进行硬件回归测试。电视配对信息、个人配置、旧编译文件和调试符号不包含在发布内容中。
+本分支已于 2026 年 9 月 25 日同步上游 master 的上述提交，并保留原有自定义功能。界面、服务、用户后台、命令行和更新器五个组件均已通过 x64 Release 编译；尚未进行电视硬件回归测试或安装包构建。电视配对信息、个人配置、编译文件和调试符号不包含在发布内容中。
 
 ## Upstream and license
 

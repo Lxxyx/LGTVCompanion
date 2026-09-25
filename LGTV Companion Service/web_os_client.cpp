@@ -17,6 +17,7 @@
 #include <boost/asio.hpp>
 #include <queue>
 #include <fstream>
+#include <atomic>
 #include <nlohmann/json.hpp>
 
 // timers
@@ -110,6 +111,8 @@ private:
 	std::string host_;
 	int socket_status_ = SOCKET_DISCONNECTED;
 	bool isPoweredOn_ = false;
+	std::atomic<bool> capture_stream_start_{ false };			// armed by the service at remote-stream connect
+	std::atomic<int> stream_start_power_{ STREAM_START_UNKNOWN };	// TV power state observed at that moment
 	std::list<Work> workQueue_;
 	std::shared_ptr<Logging> log_;
 	time_t timestamp_last_work_performed_ = 0;
@@ -147,6 +150,8 @@ public:
 	~Impl() {};
 	void close(void);
 	void enqueueWork(Work&);
+	void beginStreamStartCapture(void) { stream_start_power_ = STREAM_START_UNKNOWN; capture_stream_start_ = true; }
+	int streamStartPower(void) { return stream_start_power_.load(); }
 };
 WebOsClient::Impl::Impl(net::io_context& ioc, ssl::context& ctx, Device& settings, Logging& log)
 	: resolver_(net::make_strand(ioc))
@@ -168,10 +173,10 @@ WebOsClient::Impl::Impl(net::io_context& ioc, ssl::context& ctx, Device& setting
 	else
 		ws_tcp_.emplace(resolver_.get_executor());
 	if (device_settings_.session_key == "") // build the WebOS handshake
-		webos_handshake_ = tools::narrow(LG_HANDSHAKE_NOTPAIRED);
+		webos_handshake_ = tools::narrow(LG_HANDSHAKE_NOTPAIRED_V3);
 	else
 	{
-		webos_handshake_ = tools::narrow(LG_HANDSHAKE_PAIRED);
+		webos_handshake_ = tools::narrow(LG_HANDSHAKE_PAIRED_V3);
 		tools::replaceAllInPlace(webos_handshake_, "#CLIENTKEY#", device_settings_.session_key);
 	}
 
@@ -555,6 +560,7 @@ void WebOsClient::Impl::onRead(beast::error_code ec, std::size_t bytes_transferr
 	json payload;
 	std::string response_id;
 	std::string response_type;
+	std::string error_msg;
 	boost::ignore_unused(bytes_transferred);
 	if (ec)
 		return onError(ec, "onRead");
@@ -579,6 +585,8 @@ void WebOsClient::Impl::onRead(beast::error_code ec, std::size_t bytes_transferr
 			else
 				response_id = response["id"];
 		response_type = response["type"];
+		if (!response["error"].empty() && response["error"].is_string())
+			error_msg = response["error"];
 	}
 	catch (std::exception const& e)
 	{
@@ -598,7 +606,7 @@ void WebOsClient::Impl::onRead(beast::error_code ec, std::size_t bytes_transferr
 			{
 				device_settings_.session_key = payload["client-key"];
 				INFO("Pairing key received: %1%", device_settings_.session_key);
-				webos_handshake_ = tools::narrow(LG_HANDSHAKE_PAIRED);
+				webos_handshake_ = tools::narrow(LG_HANDSHAKE_PAIRED_V3);
 				tools::replaceAllInPlace(webos_handshake_, "#CLIENTKEY#", device_settings_.session_key);
 				setSessionKey(device_settings_.session_key, device_settings_.id); // Save session key to config file
 				// enable WOL after pairing has succeded
@@ -629,7 +637,14 @@ void WebOsClient::Impl::onRead(beast::error_code ec, std::size_t bytes_transferr
 		}
 		else if (response_type == "error")
 		{
-			INFO("User rejected or cancelled the pairing prompt");
+			if (error_msg != "")
+			{
+				ERR(error_msg);
+			}
+			else
+			{
+				INFO("User rejected or cancelled the pairing prompt");
+			}
 			workIsFinished();
 		}
 		else // Device is unregistered or pairing key is invalid.
@@ -638,7 +653,7 @@ void WebOsClient::Impl::onRead(beast::error_code ec, std::size_t bytes_transferr
 			{
 				WARNING("Pairing key was invalid. Re-pairing...");
 				device_settings_.session_key = "";
-				webos_handshake_ = tools::narrow(LG_HANDSHAKE_NOTPAIRED);
+				webos_handshake_ = tools::narrow(LG_HANDSHAKE_NOTPAIRED_V3);
 				send(webos_handshake_);
 			}
 		}
@@ -715,6 +730,9 @@ void WebOsClient::Impl::onRead(beast::error_code ec, std::size_t bytes_transferr
 		{
 			if (response_id == "getPowerState" && !payload["state"].empty() && payload["state"].is_string()) // query power state
 			{
+				// one-shot capture of the TV power state at remote-stream start (for "restore previous state")
+				if (capture_stream_start_.exchange(false))
+					stream_start_power_ = (payload["state"] == "Active" || payload["state"] == "Screen Off") ? STREAM_START_ON : STREAM_START_OFF;
 
 				if (payload["state"] != "Active" && payload["state"] != "Screen Off") // Device is not ON
 				{
@@ -1309,6 +1327,12 @@ bool WebOsClient::blankScreen(bool forced) {
 	work.forced_ = forced;
 	pimpl->enqueueWork(work);
 	return true;
+}
+void WebOsClient::beginStreamStartCapture(void) {
+	pimpl->beginStreamStartCapture();
+}
+int WebOsClient::streamStartPower(void) {
+	return pimpl->streamStartPower();
 }
 bool WebOsClient::sendRequest(std::string data, std::string log_message, int delay) {
 	Work work;

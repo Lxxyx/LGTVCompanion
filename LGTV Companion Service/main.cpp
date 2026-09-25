@@ -18,7 +18,7 @@
 // global definitions for the service
 #define SVCNAME											L"LGTVsvc"
 #define SVCDISPLAYNAME									L"LGTV Companion Service"
-#define SERVICE_DEPENDENCIES							L"Dhcp\0Dnscache\0LanmanServer\0\0"
+#define SERVICE_DEPENDENCIES							L"Dhcp\0\0"
 #define SERVICE_ACCOUNT									NULL		
 
 struct Context
@@ -489,6 +489,11 @@ DWORD WINAPI SvcEventLogSubscribeCallback(EVT_SUBSCRIBE_NOTIFY_ACTION Action, PV
 	{
 		std::wstring strfind = L"<Data Name='param5'>";
 		size_t f = xml.find(strfind);
+		if (f == std::wstring::npos)
+		{
+			strfind = L"<Data Name=\"param5\">";
+			f = xml.find(strfind);
+		}
 		if (f != std::wstring::npos)
 		{
 			size_t e = xml.find(L"<", f + 1);

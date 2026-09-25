@@ -32,6 +32,7 @@ using			json = nlohmann::json;
 #define         JSON_IDLE_FS_EXCLUSIONS			"IdleFsExclusions"
 #define         JSON_REMOTESTREAM				"RemoteStream"
 #define         JSON_REMOTESTREAM_MODE			"RemoteStreamPowerOff"
+#define         JSON_REMOTESTREAM_ENDMODE		"RemoteStreamEndMode"
 #define         JSON_EXTERNAL_API				"ExternalAPI"
 #define			JSON_MUTE_SPEAKERS				"MuteSpeakers"
 #define			JSON_TIMING_PRESHUTDOWN			"TimingPreshutdown"
@@ -44,6 +45,7 @@ using			json = nlohmann::json;
 #define			JSON_UIM_PROCESS_LIST			"BlankWhenIdleProcessList"
 #define			JSON_IGNORED_KEYS				"IgnoredKeys"
 #define			JSON_IGNORED_KEYS_LIST			"IgnoredKeysList"
+#define			JSON_UIM_IGNORE_SYSWIDE_FALLBACK "BlankWhenIdleIgnoreSystemWideFallback"
 #define			JSON_DEVICE_NAME				"Name"
 #define			JSON_DEVICE_IP					"IP"
 #define			JSON_DEVICE_UNIQUEKEY			"UniqueDeviceKey"
@@ -260,6 +262,14 @@ Preferences::Preferences(std::wstring configuration_file_name)
 					j = jsonPrefs[JSON_PREFS_NODE][JSON_REMOTESTREAM_MODE];
 					if (!j.empty() && j.is_boolean())
 						remote_streaming_host_prefer_power_off_ = j.get<bool>();
+					// Remote streaming: what to do with displays when the session ends
+					j = jsonPrefs[JSON_PREFS_NODE][JSON_REMOTESTREAM_ENDMODE];
+					if (!j.empty() && j.is_number_integer())
+					{
+						int end_mode = j.get<int>();
+						if (end_mode >= PREFS_REMOTE_END_POWER_ON && end_mode <= PREFS_REMOTE_END_RESTORE)
+							remote_streaming_host_end_mode_ = end_mode;	// ignore out-of-range values, keep the default
+					}
 					// External API
 					j = jsonPrefs[JSON_PREFS_NODE][JSON_EXTERNAL_API];
 					if (!j.empty() && j.is_boolean())
@@ -327,6 +337,11 @@ Preferences::Preferences(std::wstring configuration_file_name)
 					j = jsonPrefs[JSON_PREFS_NODE][JSON_IGNORED_KEYS];
 					if (!j.empty() && j.is_boolean())
 						user_idle_mode_ignored_keys_ = j.get<bool>();
+
+					// Ignore the system-wide (GetLastInputInfo) idle-detection fallback
+					j = jsonPrefs[JSON_PREFS_NODE][JSON_UIM_IGNORE_SYSWIDE_FALLBACK];
+					if (!j.empty() && j.is_boolean())
+						user_idle_mode_ignore_system_wide_fallback_ = j.get<bool>();
 
 					// Ignored keys list
 					j = jsonPrefs[JSON_PREFS_NODE][JSON_IGNORED_KEYS_LIST];
@@ -552,12 +567,14 @@ bool Preferences::Preferences::writeToDisk(void)
 	prefs[JSON_PREFS_NODE][JSON_UIM_VIDEO_BROWSER_DISABLE3] = (bool)user_idle_mode_disable_while_video_wake_lock_fullscreen_;
 	prefs[JSON_PREFS_NODE][JSON_UIM_PROCESS_CONTROL] = (bool)user_idle_mode_process_control_;
 	prefs[JSON_PREFS_NODE][JSON_IGNORED_KEYS] = (bool)user_idle_mode_ignored_keys_;
+	prefs[JSON_PREFS_NODE][JSON_UIM_IGNORE_SYSWIDE_FALLBACK] = (bool)user_idle_mode_ignore_system_wide_fallback_;
 	prefs[JSON_PREFS_NODE][JSON_IGNORED_KEYS_LIST] = nlohmann::json::array();
 	if (ignored_keys.size() > 0)
 		for (auto& item : ignored_keys)
 			prefs[JSON_PREFS_NODE][JSON_IGNORED_KEYS_LIST].push_back(item);
 	prefs[JSON_PREFS_NODE][JSON_REMOTESTREAM] = (bool)remote_streaming_host_support_;
 	prefs[JSON_PREFS_NODE][JSON_REMOTESTREAM_MODE] = (bool)remote_streaming_host_prefer_power_off_;
+	prefs[JSON_PREFS_NODE][JSON_REMOTESTREAM_ENDMODE] = (int)remote_streaming_host_end_mode_;
 	prefs[JSON_PREFS_NODE][JSON_EXTERNAL_API] = (bool)external_api_support_;
 	prefs[JSON_PREFS_NODE][JSON_MUTE_SPEAKERS] = (bool)user_idle_mode_mute_speakers_;
 	prefs[JSON_PREFS_NODE][JSON_TIMING_SHUTDOWN] = (int)shutdown_timing_;
