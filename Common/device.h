@@ -37,6 +37,7 @@ struct Device {
 	bool								check_hdmi_input_when_power_off = false;
 	bool								set_hdmi_input_on_power_on = false;
 	int									set_hdmi_input_on_power_on_delay = 1;
+	bool								resync_gsync_after_boot_power_on = false;
 	bool								ssl = true;
 	int									persistent_connection_level = PERSISTENT_CONNECTION_OFF;
 	uint64_t							network_interface_luid = 0;

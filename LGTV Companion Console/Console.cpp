@@ -52,6 +52,97 @@ std::atomic_bool				bTerminateThread = { false };
 WSADATA							WSAData;
 bool							bOutputContainsManyResults = false;
 
+static bool DeviceMatchesSelection(const Device& device, const std::vector<std::string>& selected_devices)
+{
+	if (selected_devices.size() == 0)
+		return true;
+
+	std::string device_id = device.id;
+	std::string device_name = device.name;
+	transform(device_id.begin(), device_id.end(), device_id.begin(), ::tolower);
+	transform(device_name.begin(), device_name.end(), device_name.begin(), ::tolower);
+
+	for (auto selected_device : selected_devices)
+	{
+		transform(selected_device.begin(), selected_device.end(), selected_device.begin(), ::tolower);
+		if (selected_device == device_id || selected_device == device_name)
+			return true;
+	}
+	return false;
+}
+
+static bool TryReadSettingValue(const nlohmann::json& response, const std::string& setting, std::string& value)
+{
+	auto read_value = [&](const nlohmann::json& source) {
+		if (!source.is_object() || !source.contains(setting))
+			return false;
+		const auto& item = source[setting];
+		if (item.is_string())
+			value = item.get<std::string>();
+		else if (item.is_boolean())
+			value = item.get<bool>() ? "on" : "off";
+		else
+			value = item.dump();
+		return true;
+	};
+
+	if (read_value(response))
+		return true;
+	if (response.contains("payload") && read_value(response["payload"]))
+		return true;
+	if (response.contains("payload") && response["payload"].is_object() && response["payload"].contains("settings")
+		&& read_value(response["payload"]["settings"]))
+		return true;
+	if (response.contains("settings") && read_value(response["settings"]))
+		return true;
+
+	return false;
+}
+
+static std::string ToggleGsync(const std::vector<std::string>& devices, const std::string& setting)
+{
+	nlohmann::json response;
+
+	for (auto& dev : Prefs.devices_)
+	{
+		if (!DeviceMatchesSelection(dev, devices))
+			continue;
+
+		nlohmann::json payload;
+		payload["category"] = "other";
+		payload["keys"] = nlohmann::json::array({ setting });
+
+		nlohmann::json query_response = SendRequest(dev, CreateRequestJson(LG_URI_GET_SYSTEM_SETTINGS, payload.dump()), false);
+		if (query_response.contains("error"))
+		{
+			response[dev.id] = query_response;
+			continue;
+		}
+
+		std::string current_value;
+		if (!TryReadSettingValue(query_response, setting, current_value))
+		{
+			response[dev.id]["error"] = "Could not determine current setting value.";
+			response[dev.id]["query"] = query_response;
+			continue;
+		}
+
+		transform(current_value.begin(), current_value.end(), current_value.begin(), ::tolower);
+		std::string target_value = current_value == "on" ? "off" : "on";
+		nlohmann::json set_response = SendRequest(dev, CreateLunaSystemSettingJson(setting, target_value, "other"), true);
+
+		response[dev.id]["setting"] = setting;
+		response[dev.id]["previous"] = current_value;
+		response[dev.id]["current"] = target_value;
+		response[dev.id]["result"] = set_response;
+	}
+
+	if (!response.is_object())
+		response["error"] = "No matching devices.";
+
+	return response.dump();
+}
+
 int main(int argc, char* argv[])
 {
 	std::vector<std::vector<std::string>> CmdLine;
@@ -374,6 +465,20 @@ std::string ProcessCommand(std::vector<std::string>& words)
 		newCmdLine.push_back("{\"activateType\":\"freesync-info\"}");
 		newCmdLine.insert(std::end(newCmdLine), std::begin(devices), std::end(devices));
 		return ProcessCommand(newCmdLine);
+	}
+	else if (command == "toggle_gsync" || command == "toggle_gsync_hdmi1" || command == "toggle_gsync_hdmi2"
+		|| command == "toggle_gsync_hdmi3" || command == "toggle_gsync_hdmi4")
+	{
+		std::string setting = "gameOptimization";
+		if (command == "toggle_gsync_hdmi1")
+			setting = "gameOptimizationHDMI1";
+		else if (command == "toggle_gsync_hdmi2")
+			setting = "gameOptimizationHDMI2";
+		else if (command == "toggle_gsync_hdmi3")
+			setting = "gameOptimizationHDMI3";
+		else if (command == "toggle_gsync_hdmi4")
+			setting = "gameOptimizationHDMI4";
+		return ToggleGsync(_Devices(words, 1), setting);
 	}
 	else if (command == "button")												// BUTTON PRESS
 	{

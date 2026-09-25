@@ -60,6 +60,7 @@ using			json = nlohmann::json;
 #define			JSON_DEVICE_CHECKINPUT			"CheckHdmiInputWhenPoweringOff"
 #define			JSON_DEVICE_SETINPUT			"SetHdmiInput"
 #define			JSON_DEVICE_SETINPUTDELAY		"SetHdmiInputDelay"
+#define			JSON_DEVICE_RESYNCGSYNCBOOT		"ResyncGsyncAfterBootPowerOn"
 #define			JSON_DEVICE_MAC					"MAC"
 #define			JSON_DEVICE_PERSISTENT			"PersistentConnectionLevel"
 #define			JSON_DEVICE_LUID				"NicLuid"
@@ -427,6 +428,9 @@ Preferences::Preferences(std::wstring configuration_file_name)
 						else if (device.set_hdmi_input_on_power_on_delay > 30)
 							device.set_hdmi_input_on_power_on_delay = 30;
 
+						if (item.value()[JSON_DEVICE_RESYNCGSYNCBOOT].is_boolean())
+							device.resync_gsync_after_boot_power_on = item.value()[JSON_DEVICE_RESYNCGSYNCBOOT].get<bool>();
+
 						if (item.value()[JSON_DEVICE_NEWSOCK].is_boolean())
 							device.ssl = item.value()[JSON_DEVICE_NEWSOCK].get<bool>();
 
@@ -598,6 +602,7 @@ bool Preferences::Preferences::writeToDisk(void)
 
 		prefs[id][JSON_DEVICE_SETINPUT] = (bool)item.set_hdmi_input_on_power_on;
 		prefs[id][JSON_DEVICE_SETINPUTDELAY] = item.set_hdmi_input_on_power_on_delay;
+		prefs[id][JSON_DEVICE_RESYNCGSYNCBOOT] = (bool)item.resync_gsync_after_boot_power_on;
 
 		prefs[id][JSON_DEVICE_NEWSOCK] = (bool)item.ssl;
 

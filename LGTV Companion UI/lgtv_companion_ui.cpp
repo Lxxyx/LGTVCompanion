@@ -99,7 +99,14 @@ COPYRIGHT
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <mutex>
+#include <memory>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <unordered_map>
+#include <unordered_set>
+#include <fstream>
+#include <iomanip>
 #include "resource.h"
 
 #pragma comment(lib, "Comctl32.lib")
@@ -139,6 +146,7 @@ COPYRIGHT
 #define									APP_LISTBOX_REDRAW				WM_USER+17
 #define									APP_IGNORED_KEYS_ADD            WM_USER+18
 #define									APP_IGNORED_KEYS_DELETE         WM_USER+19
+#define									APP_DEVICE_IP_SCAN_DONE         WM_USER+20
 #define									COPYDATA_MUTEX_WAIT				10
 
 // Global Variables:
@@ -177,8 +185,239 @@ inline static std::mutex				copydata_mutex_;
 WNDPROC									ignored_keys_list_proc = NULL;
 bool									ignored_key_capture_pending = false;
 int										ignored_key_capture_index = LB_ERR;
+std::unordered_map<std::string, bool>	gsync_toggle_state_;
 
 Preferences								Prefs(CONFIG_FILE);
+
+struct DeviceIpScanResult
+{
+	bool found = false;
+	std::wstring ip;
+};
+
+static bool getIpv4Prefix(const std::string& value, std::string& prefix)
+{
+	std::string ip = value;
+	size_t slash = ip.find("/");
+	if (slash != std::string::npos)
+		ip = ip.substr(0, slash);
+	if (ip == "" || ip == "0.0.0.0" || ip == "127.0.0.1")
+		return false;
+
+	in_addr address;
+	if (inet_pton(AF_INET, ip.c_str(), &address) != 1)
+		return false;
+
+	std::vector<std::string> parts = tools::stringsplit(ip, ".");
+	if (parts.size() != 4)
+		return false;
+
+	prefix = parts[0] + "." + parts[1] + "." + parts[2] + ".";
+	return true;
+}
+
+static std::vector<std::string> getDeviceIpScanPrefixes(const std::string& current_ip)
+{
+	std::vector<std::string> prefixes;
+	std::unordered_set<std::string> seen;
+	std::string prefix;
+
+	if (getIpv4Prefix(current_ip, prefix) && seen.insert(prefix).second)
+		prefixes.push_back(prefix);
+
+	for (const auto& local_ip : tools::getLocalIP())
+	{
+		if (getIpv4Prefix(local_ip, prefix) && seen.insert(prefix).second)
+			prefixes.push_back(prefix);
+	}
+
+	return prefixes;
+}
+
+static bool getFirstMacAddress(HWND mac_edit, std::string& mac)
+{
+	std::wstring text = tools::getWndText(mac_edit);
+	std::wistringstream lines(text);
+	std::wstring line;
+
+	while (std::getline(lines, line))
+	{
+		std::string compact;
+		for (wchar_t ch : line)
+		{
+			if ((ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F'))
+				compact.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+		}
+
+		if (compact.size() != 12)
+			continue;
+
+		mac.clear();
+		for (int i = 0; i < 6; i++)
+		{
+			if (i > 0)
+				mac += ":";
+			mac += compact.substr(i * 2, 2);
+		}
+		return true;
+	}
+
+	return false;
+}
+
+static std::string formatMacAddress(const BYTE* physical_address, ULONG physical_address_len)
+{
+	if (physical_address_len < 6)
+		return "";
+
+	std::stringstream ss;
+	ss << std::hex << std::uppercase << std::setfill('0');
+	for (int i = 0; i < 6; i++)
+	{
+		if (i > 0)
+			ss << ":";
+		ss << std::setw(2) << static_cast<unsigned>(physical_address[i]);
+	}
+	return ss.str();
+}
+
+static bool findIpByMacOnPrefixes(const std::vector<std::string>& prefixes, const std::string& mac, std::string& found_ip)
+{
+	std::atomic<int> next_index = 0;
+	std::atomic<bool> found = false;
+	std::mutex result_mutex;
+	std::vector<std::string> candidates;
+
+	for (const auto& prefix : prefixes)
+		for (int host = 1; host <= 254; host++)
+			candidates.push_back(prefix + std::to_string(host));
+
+	const int worker_count = min(32, max(1, static_cast<int>(candidates.size())));
+	std::vector<std::thread> workers;
+	for (int i = 0; i < worker_count; i++)
+	{
+		workers.emplace_back([&]()
+			{
+				while (!found.load())
+				{
+					int index = next_index.fetch_add(1);
+					if (index >= static_cast<int>(candidates.size()))
+						break;
+
+					IPAddr destination = inet_addr(candidates[index].c_str());
+					if (destination == INADDR_NONE)
+						continue;
+
+					BYTE physical_address[8] = {};
+					ULONG physical_address_len = sizeof(physical_address);
+					if (SendARP(destination, 0, physical_address, &physical_address_len) != NO_ERROR)
+						continue;
+
+					if (formatMacAddress(physical_address, physical_address_len) == mac)
+					{
+						std::lock_guard<std::mutex> lock(result_mutex);
+						found_ip = candidates[index];
+						found.store(true);
+						break;
+					}
+				}
+			});
+	}
+
+	for (auto& worker : workers)
+		worker.join();
+
+	return found.load();
+}
+
+static std::wstring getExecutableDirectory()
+{
+	TCHAR buffer[MAX_PATH] = { 0 };
+	if (!GetModuleFileName(NULL, buffer, MAX_PATH))
+		return L"";
+
+	std::wstring path = buffer;
+	std::wstring::size_type pos = path.find_last_of(L"\\/");
+	if (pos == std::wstring::npos)
+		return L"";
+
+	return path.substr(0, pos + 1);
+}
+
+static bool runCliCommand(const std::wstring& arguments)
+{
+	std::wstring directory = getExecutableDirectory();
+	if (directory.empty())
+		return false;
+
+	std::wstring exe_path = directory + L"LGTVcli.exe";
+	STARTUPINFO si = {};
+	si.cb = sizeof(STARTUPINFO);
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+
+	PROCESS_INFORMATION pi = {};
+	std::wstring command_line = L"\"" + exe_path + L"\" " + arguments;
+	std::vector<wchar_t> buffer(command_line.begin(), command_line.end());
+	buffer.push_back(L'\0');
+
+	if (!CreateProcessW(exe_path.c_str(), buffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, directory.c_str(), &si, &pi))
+		return false;
+
+	WaitForSingleObject(pi.hProcess, 15000);
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+}
+
+static std::wstring getGsyncToggleStatePath()
+{
+	std::wstring path = tools::widen(Prefs.data_path_);
+	path += L"gsync_toggle_state.json";
+	return path;
+}
+
+static void loadGsyncToggleState()
+{
+	std::ifstream input(getGsyncToggleStatePath().c_str());
+	if (!input.is_open())
+		return;
+
+	try
+	{
+		nlohmann::json json_data;
+		input >> json_data;
+		if (!json_data.is_object())
+			return;
+
+		gsync_toggle_state_.clear();
+		for (const auto& item : json_data.items())
+		{
+			if (item.value().is_boolean())
+				gsync_toggle_state_[item.key()] = item.value().get<bool>();
+		}
+	}
+	catch (...)
+	{
+	}
+}
+
+static void saveGsyncToggleState()
+{
+	try
+	{
+		nlohmann::json json_data = nlohmann::json::object();
+		for (const auto& item : gsync_toggle_state_)
+			json_data[item.first] = item.second;
+
+		std::ofstream output(getGsyncToggleStatePath().c_str(), std::ios::trunc);
+		if (output.is_open())
+			output << json_data.dump(4);
+	}
+	catch (...)
+	{
+	}
+}
 
 int ignoredKeyFindIndexByCode(HWND hWnd, DWORD key_code)
 {
@@ -271,6 +510,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE Instance,
 		MessageBox(NULL, L"Error when reading the configuration file.\n\nApplication terminated!", APPNAME, MB_OK | MB_ICONERROR);
 		return false; 
 	}
+	loadGsyncToggleState();
 	// tweak prefs regarding windows topology
 	bool bTop = false;
 	for (auto m : Prefs.devices_)
@@ -408,9 +648,13 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 		SendDlgItemMessage(hWnd, IDC_SPLIT, WM_SETFONT, (WPARAM)h_edit_small_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDOK, WM_SETFONT, (WPARAM)h_edit_small_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDC_OPTIONS, WM_SETFONT, (WPARAM)h_edit_medium_font, MAKELPARAM(TRUE, 0));
+		SendDlgItemMessage(hWnd, IDC_TEST, WM_SETFONT, (WPARAM)h_edit_small_font, MAKELPARAM(TRUE, 0));
 
 		SendMessage(GetDlgItem(hWnd, IDC_COMBO), (UINT)CB_RESETCONTENT, (WPARAM)0, (LPARAM)0);
 		SendMessage(GetDlgItem(hWnd, IDC_COMBO), (UINT)CB_SETCURSEL, (WPARAM)-1, (LPARAM)0);
+		SetWindowText(GetDlgItem(hWnd, IDC_TEST), L"G-Sync");
+		ShowWindow(GetDlgItem(hWnd, IDC_TEST), SW_SHOW);
+		SetWindowPos(GetDlgItem(hWnd, IDC_TEST), NULL, 297, 7, 84, 18, SWP_NOZORDER);
 
 		if (Prefs.devices_.size() > 0)
 		{
@@ -423,12 +667,14 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 			CheckDlgButton(hWnd, IDC_CHECK_ENABLE, Prefs.devices_[0].enabled ? BST_CHECKED : BST_UNCHECKED);
 			EnableWindow(GetDlgItem(hWnd, IDC_COMBO), true);
 			EnableWindow(GetDlgItem(hWnd, IDC_CHECK_ENABLE), true);
+			EnableWindow(GetDlgItem(hWnd, IDC_TEST), true);
 
 			SetDlgItemText(hWnd, IDC_SPLIT, L"C&onfigure");
 		}
 		else
 		{
 			EnableWindow(GetDlgItem(hWnd, IDC_COMBO), false);
+			EnableWindow(GetDlgItem(hWnd, IDC_TEST), false);
 			SetDlgItemText(hWnd, IDC_SPLIT, L"&Scan");
 		}
 		SendMessageW(GetDlgItem(hWnd, IDC_OPTIONS), BM_SETIMAGE, IMAGE_ICON, (LPARAM)h_icon_options);
@@ -450,6 +696,7 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 		CheckDlgButton(h_device_wnd, IDC_CHECK_HDMI_INPUT_CHECKBOX, BST_UNCHECKED);
 
 		CheckDlgButton(h_device_wnd, IDC_SET_HDMI_INPUT_CHECKBOX, BST_UNCHECKED);
+		CheckDlgButton(h_device_wnd, IDC_RESYNC_GSYNC_BOOT, BST_UNCHECKED);
 		EnableWindow(GetDlgItem(h_device_wnd, IDC_SET_HDMI_DELAY), false);
 		SetWindowText(GetDlgItem(h_device_wnd, IDC_SET_HDMI_DELAY), L"1");
 		SendMessage(GetDlgItem(h_device_wnd, IDC_COMBO_PERSISTENCE), (UINT)CB_SETCURSEL, (WPARAM)0, (LPARAM)0);
@@ -485,6 +732,7 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 		CheckDlgButton(h_device_wnd, IDC_CHECK_HDMI_INPUT_CHECKBOX, Prefs.devices_[sel].check_hdmi_input_when_power_off);
 	
 		CheckDlgButton(h_device_wnd, IDC_SET_HDMI_INPUT_CHECKBOX, Prefs.devices_[sel].set_hdmi_input_on_power_on);
+		CheckDlgButton(h_device_wnd, IDC_RESYNC_GSYNC_BOOT, Prefs.devices_[sel].resync_gsync_after_boot_power_on);
 		EnableWindow(GetDlgItem(h_device_wnd, IDC_SET_HDMI_DELAY), Prefs.devices_[sel].set_hdmi_input_on_power_on ? true : false);
 		SetWindowText(GetDlgItem(h_device_wnd, IDC_SET_HDMI_DELAY), tools::widen(std::to_string(Prefs.devices_[sel].set_hdmi_input_on_power_on_delay)).c_str());
 		SendDlgItemMessage(h_device_wnd, IDC_SET_HDMI_DELAY_SPIN, UDM_SETPOS, (WPARAM)NULL, (LPARAM)Prefs.devices_[sel].set_hdmi_input_on_power_on_delay);
@@ -679,6 +927,7 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 			SendMessage(GetDlgItem(hWnd, IDC_COMBO), (UINT)CB_RESETCONTENT, (WPARAM)0, (LPARAM)0);
 			SendMessage(GetDlgItem(hWnd, IDC_COMBO), (UINT)CB_SETCURSEL, (WPARAM)-1, (LPARAM)0);
 			EnableWindow(GetDlgItem(hWnd, IDC_COMBO), false);
+			EnableWindow(GetDlgItem(hWnd, IDC_TEST), false);
 			SetDlgItemText(hWnd, IDC_SPLIT, L"&Scan");
 		}
 		else
@@ -696,6 +945,7 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 				CheckDlgButton(hWnd, IDC_CHECK_ENABLE, Prefs.devices_[j].enabled ? BST_CHECKED : BST_UNCHECKED);
 				EnableWindow(GetDlgItem(hWnd, IDC_CHECK_ENABLE), true);
 				EnableWindow(GetDlgItem(hWnd, IDC_COMBO), true);
+				EnableWindow(GetDlgItem(hWnd, IDC_TEST), true);
 				SetDlgItemText(hWnd, IDC_SPLIT, L"C&onfigure");
 			}
 			else
@@ -704,6 +954,7 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 				EnableWindow(GetDlgItem(hWnd, IDC_CHECK_ENABLE), false);
 				SendMessage(GetDlgItem(hWnd, IDC_COMBO), (UINT)CB_SETCURSEL, (WPARAM)-1, (LPARAM)0);
 				EnableWindow(GetDlgItem(hWnd, IDC_COMBO), false);
+				EnableWindow(GetDlgItem(hWnd, IDC_TEST), false);
 				SetDlgItemText(hWnd, IDC_SPLIT, L"&Scan");
 			}
 		}
@@ -856,7 +1107,53 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 			}break;
 			case IDC_TEST:
 			{
-//				MessageBox(NULL, std::to_wstring(copydata_count).c_str(), L"Message", MB_OK);
+				int sel = (int)(SendMessage(GetDlgItem(hWnd, IDC_COMBO), (UINT)CB_GETCURSEL, (WPARAM)0, (LPARAM)0));
+				if (sel == CB_ERR)
+					break;
+
+				std::string state_key = Prefs.devices_[sel].id;
+				std::wstring device_id = L"\"";
+				device_id += tools::widen(Prefs.devices_[sel].id);
+				device_id += L"\"";
+				std::wstring state = L"on";
+				std::wstring hdmi_suffix;
+				if (Prefs.devices_[sel].sourceHdmiInput >= 1 && Prefs.devices_[sel].sourceHdmiInput <= 4)
+				{
+					state_key += "_hdmi";
+					state_key += std::to_string(Prefs.devices_[sel].sourceHdmiInput);
+					hdmi_suffix = std::to_wstring(Prefs.devices_[sel].sourceHdmiInput);
+				}
+				bool next_state_on = true;
+				auto it = gsync_toggle_state_.find(state_key);
+				if (it != gsync_toggle_state_.end())
+					next_state_on = !it->second;
+				state = next_state_on ? L"on" : L"off";
+
+				std::vector<std::wstring> commands;
+				commands.emplace_back(L"-gameoptimization " + state + L" " + device_id);
+				if (!hdmi_suffix.empty())
+				{
+					commands.emplace_back(L"-gameoptimization_hdmi" + hdmi_suffix + L" " + state + L" " + device_id);
+					commands.emplace_back(L"-freesyncoled_hdmi" + hdmi_suffix + L" off " + device_id);
+				}
+				commands.emplace_back(L"-freesync off " + device_id);
+
+				std::wstring cli_arguments;
+				for (const auto& command_line : commands)
+				{
+					if (!cli_arguments.empty())
+						cli_arguments += L" ";
+					cli_arguments += command_line;
+				}
+
+				if (!runCliCommand(cli_arguments))
+				{
+					customMsgBox(hWnd, L"Failed to start LGTVcli.exe.", L"G-Sync toggle failed", MB_OK | MB_ICONEXCLAMATION);
+					break;
+				}
+
+				gsync_toggle_state_[state_key] = next_state_on;
+				saveGsyncToggleState();
 			}break;
 			case IDC_SPLIT:
 			{
@@ -890,6 +1187,7 @@ LRESULT CALLBACK WndMainProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 
 				CheckDlgButton(hWnd, IDC_CHECK_ENABLE, Prefs.devices_[sel].enabled ? BST_CHECKED : BST_UNCHECKED);
 				EnableWindow(GetDlgItem(hWnd, IDC_CHECK_ENABLE), true);
+				EnableWindow(GetDlgItem(hWnd, IDC_TEST), true);
 			}
 		}break;
 
@@ -1159,11 +1457,27 @@ LRESULT CALLBACK WndDeviceProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 {
 	switch (message)
 	{
+	case APP_DEVICE_IP_SCAN_DONE:
+	{
+		std::unique_ptr<DeviceIpScanResult> result(reinterpret_cast<DeviceIpScanResult*>(lParam));
+		SetWindowText(GetDlgItem(hWnd, IDC_FIND_DEVICE_IP), L"Find");
+		EnableWindow(GetDlgItem(hWnd, IDC_FIND_DEVICE_IP), true);
+		if (result && result->found)
+		{
+			SetWindowText(GetDlgItem(hWnd, IDC_DEVICEIP), result->ip.c_str());
+			EnableWindow(GetDlgItem(hWnd, IDOK), true);
+		}
+		else
+		{
+			customMsgBox(hWnd, L"No IP address was found for the configured MAC address on the local subnet.", L"Find IP address", MB_OK | MB_ICONINFORMATION);
+		}
+	}break;
 	case WM_INITDIALOG:
 	{
 		SetCurrentProcessExplicitAppUserModelID(L"JPersson.LGTVCompanion.18");
 		SendDlgItemMessage(hWnd, IDC_DEVICENAME, WM_SETFONT, (WPARAM)h_edit_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDC_DEVICEIP, WM_SETFONT, (WPARAM)h_edit_font, MAKELPARAM(TRUE, 0));
+		SendDlgItemMessage(hWnd, IDC_FIND_DEVICE_IP, WM_SETFONT, (WPARAM)h_edit_small_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDC_SET_HDMI_DELAY, WM_SETFONT, (WPARAM)h_edit_medium_font, MAKELPARAM(TRUE, 0));
 		SendDlgItemMessage(hWnd, IDC_SET_HDMI_DELAY_SPIN, UDM_SETRANGE, (WPARAM)NULL, MAKELPARAM(30, 0));
 		SendDlgItemMessage(hWnd, IDC_DEVICEMACS, WM_SETFONT, (WPARAM)h_edit_medium_font, MAKELPARAM(TRUE, 0));
@@ -1360,7 +1674,39 @@ LRESULT CALLBACK WndDeviceProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 		{
 			switch (LOWORD(wParam))
 			{
+			case IDC_FIND_DEVICE_IP:
+			{
+				std::string mac;
+				if (!getFirstMacAddress(GetDlgItem(hWnd, IDC_DEVICEMACS), mac))
+				{
+					customMsgBox(hWnd, L"Please configure a valid MAC address before searching for the IP address.", L"Find IP address", MB_OK | MB_ICONEXCLAMATION);
+					break;
+				}
+
+				std::vector<std::string> prefixes = getDeviceIpScanPrefixes(tools::narrow(tools::getWndText(GetDlgItem(hWnd, IDC_DEVICEIP))));
+				if (prefixes.empty())
+				{
+					customMsgBox(hWnd, L"No local IPv4 subnet was found to scan.", L"Find IP address", MB_OK | MB_ICONEXCLAMATION);
+					break;
+				}
+
+				SetWindowText(GetDlgItem(hWnd, IDC_FIND_DEVICE_IP), L"...");
+				EnableWindow(GetDlgItem(hWnd, IDC_FIND_DEVICE_IP), false);
+
+				std::thread([hWnd, mac, prefixes]()
+					{
+						std::unique_ptr<DeviceIpScanResult> result = std::make_unique<DeviceIpScanResult>();
+						std::string found_ip;
+						result->found = findIpByMacOnPrefixes(prefixes, mac, found_ip);
+						if (result->found)
+							result->ip = tools::widen(found_ip);
+
+						if (IsWindow(hWnd))
+							PostMessage(hWnd, APP_DEVICE_IP_SCAN_DONE, 0, reinterpret_cast<LPARAM>(result.release()));
+					}).detach();
+			}break;
 			case IDC_CHECK_HDMI_INPUT_CHECKBOX:
+			case IDC_RESYNC_GSYNC_BOOT:
 			{
 				EnableWindow(GetDlgItem(hWnd, IDOK), true);
 			}break;
@@ -1445,6 +1791,7 @@ LRESULT CALLBACK WndDeviceProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 
 							Prefs.devices_[sel].set_hdmi_input_on_power_on = IsDlgButtonChecked(hWnd, IDC_SET_HDMI_INPUT_CHECKBOX) == BST_CHECKED;
 							Prefs.devices_[sel].set_hdmi_input_on_power_on_delay = atoi(tools::narrow(tools::getWndText(GetDlgItem(hWnd, IDC_SET_HDMI_DELAY))).c_str());
+							Prefs.devices_[sel].resync_gsync_after_boot_power_on = IsDlgButtonChecked(hWnd, IDC_RESYNC_GSYNC_BOOT) == BST_CHECKED;
 
 							int wol_selection = (int)(SendMessage(GetDlgItem(hWnd, IDC_COMBO_WOL), (UINT)CB_GETCURSEL, (WPARAM)0, (LPARAM)0));
 
@@ -1511,6 +1858,7 @@ LRESULT CALLBACK WndDeviceProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 							sess.check_hdmi_input_when_power_off = IsDlgButtonChecked(hWnd, IDC_CHECK_HDMI_INPUT_CHECKBOX) == BST_CHECKED;
 							sess.set_hdmi_input_on_power_on = IsDlgButtonChecked(hWnd, IDC_SET_HDMI_INPUT_CHECKBOX) == BST_CHECKED;
 							sess.set_hdmi_input_on_power_on_delay = atoi(tools::narrow(tools::getWndText(GetDlgItem(hWnd, IDC_SET_HDMI_DELAY))).c_str());
+							sess.resync_gsync_after_boot_power_on = IsDlgButtonChecked(hWnd, IDC_RESYNC_GSYNC_BOOT) == BST_CHECKED;
 							
 							int luid_selection = (int)(SendMessage(GetDlgItem(hWnd, IDC_COMBO_NIC), (UINT)CB_GETCURSEL, (WPARAM)0, (LPARAM)0));
 							if (luid_selection != CB_ERR)

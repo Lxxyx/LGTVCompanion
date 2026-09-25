@@ -16,6 +16,7 @@
 #include <fstream>
 #include <sstream>
 #include <tlhelp32.h>
+#include <unordered_map>
 
 using			json = nlohmann::json;
 
@@ -39,6 +40,7 @@ public:
 	WebOsClient client_;
 	Device device_;
 	bool topology_enabled_ = false;
+	bool boot_gsync_resync_pending_ = false;
 	SessionWrapper(boost::asio::io_context& ioc, boost::asio::ssl::context& ctx, Device& dev, Logging& log) 
 		: client_(ioc, ctx, dev, log)
 	{
@@ -59,6 +61,7 @@ private:
 	bool												screensaver_active_ = false;
 	time_t												time_last_resume_or_boot_time = 0;
 	time_t												time_last_power_on = 0;
+	time_t												time_boot_gsync_resync_armed_ = 0;
 	time_t												time_last_suspend = 0;
 	bool												user_idle_mode_log_ = true;
 	int													event_log_callback_status_ = NULL;
@@ -70,6 +73,10 @@ private:
 	void												processEvent(Event&, SessionWrapper&);
 	bool												isScreensaverActive(void);
 	bool												setHdmiInput(Event&, SessionWrapper&);
+	bool												toggleGsync(SessionWrapper&);
+	std::wstring										getGsyncToggleStatePath(void);
+	std::unordered_map<std::string, bool>				loadGsyncToggleState(void);
+	void												saveGsyncToggleState(std::unordered_map<std::string, bool>&);
 	void												enableSession(std::vector<std::string>);
 	void												disableSession(std::vector<std::string>);
 	std::string											setTopology(std::vector<std::string>);
@@ -421,6 +428,9 @@ void Companion::Impl::dispatchEvent(Event& event) {
 		break;
 	case EVENT_SYSTEM_BOOT:
 		time_last_resume_or_boot_time = pp_entry;
+		time_boot_gsync_resync_armed_ = pp_entry;
+		for (auto& session : sessions_)
+			session->boot_gsync_resync_pending_ = session->device_.resync_gsync_after_boot_power_on;
 		break;
 	default:break;
 	}
@@ -459,6 +469,91 @@ bool Companion::Impl::setHdmiInput(Event& event, SessionWrapper& session)
 	tools::replaceAllInPlace(log, "#ARG#", std::to_string(session.device_.sourceHdmiInput));
 	change_hdmi_input_event.set(EVENT_REQUEST, event.getDevices(), LG_URI_LAUNCH, payload, log);
 	session.client_.sendRequest(change_hdmi_input_event.getData(), log, session.device_.set_hdmi_input_on_power_on_delay);
+	return true;
+}
+std::wstring Companion::Impl::getGsyncToggleStatePath(void)
+{
+	std::wstring path = tools::widen(prefs_.data_path_);
+	path += L"gsync_toggle_state.json";
+	return path;
+}
+std::unordered_map<std::string, bool> Companion::Impl::loadGsyncToggleState(void)
+{
+	std::unordered_map<std::string, bool> state;
+	std::ifstream input(getGsyncToggleStatePath().c_str());
+	if (!input.is_open())
+		return state;
+
+	try
+	{
+		nlohmann::json json_data;
+		input >> json_data;
+		if (!json_data.is_object())
+			return state;
+
+		for (const auto& item : json_data.items())
+			if (item.value().is_boolean())
+				state[item.key()] = item.value().get<bool>();
+	}
+	catch (...)
+	{
+	}
+
+	return state;
+}
+void Companion::Impl::saveGsyncToggleState(std::unordered_map<std::string, bool>& state)
+{
+	try
+	{
+		nlohmann::json json_data = nlohmann::json::object();
+		for (const auto& item : state)
+			json_data[item.first] = item.second;
+
+		std::ofstream output(getGsyncToggleStatePath().c_str(), std::ios::trunc);
+		if (output.is_open())
+			output << json_data.dump(4);
+	}
+	catch (...)
+	{
+	}
+}
+bool Companion::Impl::toggleGsync(SessionWrapper& session)
+{
+	Event event;
+	std::vector<std::string> devices;
+	std::string state_key = session.device_.id;
+	std::string state = "on";
+	std::string hdmi_suffix;
+	std::unordered_map<std::string, bool> toggle_state = loadGsyncToggleState();
+	bool next_state_on = true;
+
+	devices.push_back(session.device_.id);
+	if (session.device_.sourceHdmiInput >= 1 && session.device_.sourceHdmiInput <= 4)
+	{
+		state_key += "_hdmi";
+		state_key += std::to_string(session.device_.sourceHdmiInput);
+		hdmi_suffix = std::to_string(session.device_.sourceHdmiInput);
+	}
+
+	auto it = toggle_state.find(state_key);
+	if (it != toggle_state.end())
+		next_state_on = !it->second;
+	state = next_state_on ? "on" : "off";
+
+	event.set(EVENT_LUNA_SYSTEMSET_BASIC, devices, "gameOptimization", state, "other", "", "Toggle VRR / G-Sync");
+	session.client_.sendRequest(event.getData(), event.getLogMessage());
+	if (hdmi_suffix != "")
+	{
+		event.set(EVENT_LUNA_SYSTEMSET_BASIC, devices, "gameOptimizationHDMI" + hdmi_suffix, state, "other", "", "Toggle HDMI VRR / G-Sync");
+		session.client_.sendRequest(event.getData(), event.getLogMessage());
+		event.set(EVENT_LUNA_SYSTEMSET_BASIC, devices, "freesyncOLEDHDMI" + hdmi_suffix, "off", "other", "", "Set OLED FreeSync off");
+		session.client_.sendRequest(event.getData(), event.getLogMessage());
+	}
+	event.set(EVENT_LUNA_SYSTEMSET_BASIC, devices, "freesync", "off", "other", "", "Set AMD FreeSync off");
+	session.client_.sendRequest(event.getData(), event.getLogMessage());
+
+	toggle_state[state_key] = next_state_on;
+	saveGsyncToggleState(toggle_state);
 	return true;
 }
 void Companion::Impl::processEvent(Event& event, SessionWrapper& session)
@@ -549,6 +644,12 @@ void Companion::Impl::processEvent(Event& event, SessionWrapper& session)
 				work_was_enqueued = session.client_.powerOn();
 				if (session.device_.set_hdmi_input_on_power_on) 
 					work_was_enqueued = setHdmiInput(event, session);
+				if (session.boot_gsync_resync_pending_)
+				{
+					session.boot_gsync_resync_pending_ = false;
+					if (time_boot_gsync_resync_armed_ != 0 && time(0) - time_boot_gsync_resync_armed_ <= 300)
+						work_was_enqueued = toggleGsync(session);
+				}
 				break;
 
 			case EVENT_SYSTEM_SUSPEND:
@@ -1039,6 +1140,36 @@ void Companion::Impl::ipcCallback(std::wstring message, bool recursive)
 				cmd_line_start_app_with_param += dev;
 			}
 			ipcCallback(tools::widen(cmd_line_start_app_with_param), true);
+			continue;
+		}
+		else if (command == "resync_gsync" || command == "resync_gsync_hdmi1" || command == "resync_gsync_hdmi2"
+			|| command == "resync_gsync_hdmi3" || command == "resync_gsync_hdmi4")
+		{
+			std::vector<std::string> devices = grabDevices(words, 1);
+			std::string toggle_command = "-gameoptimization ";
+			if (command == "resync_gsync_hdmi1")
+				toggle_command = "-gameoptimization_hdmi1 ";
+			else if (command == "resync_gsync_hdmi2")
+				toggle_command = "-gameoptimization_hdmi2 ";
+			else if (command == "resync_gsync_hdmi3")
+				toggle_command = "-gameoptimization_hdmi3 ";
+			else if (command == "resync_gsync_hdmi4")
+				toggle_command = "-gameoptimization_hdmi4 ";
+
+			std::string cmd_line_off = toggle_command + "off";
+			std::string cmd_line_on = toggle_command + "on";
+			for (auto& dev : devices)
+			{
+				cmd_line_off += " ";
+				cmd_line_off += dev;
+				cmd_line_on += " ";
+				cmd_line_on += dev;
+			}
+
+			INFO_("CLI", "Re-syncing VRR / G-Sync handshake: %1%", validateDevices(devices));
+			ipcCallback(tools::widen(cmd_line_off), true);
+			Sleep(800);
+			ipcCallback(tools::widen(cmd_line_on), true);
 			continue;
 		}
 		else if (command == "servicemenu")									// SHOW SERVICE MENU

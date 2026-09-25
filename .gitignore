@@ -341,3 +341,13 @@ healthchecksdb
 
 # VCPKG
 /vcpkg_installed/
+# Local device data, assistant sessions, and desktop build archives
+.deepseek/
+.backup*/
+dist/
+config.json
+gsync_toggle_state.json
+.env
+.env.*
+*.pem
+*.key

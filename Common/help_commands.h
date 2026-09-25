@@ -43,6 +43,10 @@ Commands are case-insensitive, but JSON typically is case-sensitive.
 ## Button commands ##
 -button [button]                                virtual remote button press
 -freesyncinfo                                   show freesync info panel with FPS (the 7 x tap on green button)
+-toggle_gsync                                   toggle VRR / G-Sync on or off
+-toggle_gsync_hdmiX                             toggle HDMI-specific VRR / G-Sync on or off
+-resync_gsync                                   toggle VRR / G-Sync off then on
+-resync_gsync_hdmiX                             toggle HDMI-specific game optimization off then on
 
 ## Get system, picture or audio settings ##
 -get_system_settings [category] [json_keys]     get value(s) of settings in a category
